@@ -1,6 +1,8 @@
 import type { Customer, Product, Enquiry, FollowUp, Sale, Activity, Message } from '../types';
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:53211/api';';
+const API_BASE_URL =
+  import.meta.env.VITE_API_BASE_URL ||
+  'http://localhost:53211/api';
 
 export interface UserSession {
   id: string;
