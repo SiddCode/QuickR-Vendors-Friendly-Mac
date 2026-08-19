@@ -94,16 +94,32 @@ export async function generateAI(prompt, options = {}) {
 
     const data = await apiRes.json().catch(() => null);
 
-    const generatedText =
-      data?.choices?.[0]?.message?.content;
+    const rawContent = data?.choices?.[0]?.message?.content;
+    let generatedText = '';
 
-    if (
-      !generatedText ||
-      typeof generatedText !== 'string'
-    ) {
+    if (typeof rawContent === 'string') {
+      generatedText = rawContent;
+    } else if (Array.isArray(rawContent)) {
+      generatedText = rawContent
+        .map(part => {
+          if (typeof part === 'string') return part;
+          if (part && typeof part === 'object' && typeof part.text === 'string') return part.text;
+          return '';
+        })
+        .filter(Boolean)
+        .join('\n');
+    }
+
+    if (!generatedText || typeof generatedText !== 'string' || !generatedText.trim()) {
+      const choice = data?.choices?.[0];
       console.error(
-        '[OpenRouter AI] Invalid response:',
-        data
+        '[OpenRouter AI] Invalid response content. Diagnostics:',
+        {
+          finish_reason: choice?.finish_reason || 'N/A',
+          native_finish_reason: choice?.native_finish_reason || 'N/A',
+          messageKeys: choice?.message ? Object.keys(choice.message) : [],
+          model: data?.model || 'N/A'
+        }
       );
 
       const err = new Error(
