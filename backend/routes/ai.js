@@ -1497,7 +1497,7 @@ ${isAdmin ? `SHOP LEADERS & PLATFORM HIGHLIGHTS:\n${JSON.stringify(shopLeaders, 
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 120000);
 
-    let ollamaRes;
+    let Res;
     try {
       ollamaRes = await fetch('http://127.0.0.1:11434/api/generate', {
         method: 'POST',
