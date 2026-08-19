@@ -36,9 +36,12 @@ export async function generateAI(prompt, options = {}) {
     controller.abort();
   }, timeoutMs);
 
+  const apiUrl = 'https://openrouter.ai/api/v1/chat/completions';
+  const modelName = 'openrouter/free';
+
   try {
     const apiRes = await fetch(
-      'https://openrouter.ai/api/v1/chat/completions',
+      apiUrl,
       {
         method: 'POST',
 
@@ -50,7 +53,7 @@ export async function generateAI(prompt, options = {}) {
         },
 
         body: JSON.stringify({
-          model: 'qwen/qwen3-30b-a3b:free',
+          model: modelName,
 
           messages: [
             {
