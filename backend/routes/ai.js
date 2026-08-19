@@ -37,121 +37,128 @@ export async function generateAI(prompt, options = {}) {
   }, timeoutMs);
 
   const apiUrl = 'https://openrouter.ai/api/v1/chat/completions';
-  const modelName = 'openrouter/free';
+  const primaryModel = process.env.QWEN_MODEL || 'meta-llama/llama-3.3-70b-instruct:free';
+  const fallbackModel = 'google/gemini-2.0-flash-exp:free';
+  const modelsToTry = [primaryModel, fallbackModel];
 
-  try {
-    const apiRes = await fetch(
-      apiUrl,
-      {
-        method: 'POST',
+  let lastError = null;
 
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${apiKey}`,
-          'HTTP-Referer': 'https://quickr-vendors-friendly-mac.onrender.com',
-          'X-Title': 'QuickR'
-        },
-
-        body: JSON.stringify({
-          model: modelName,
-
-          messages: [
-            {
-              role: 'user',
-              content: prompt
-            }
-          ],
-
-          max_tokens: maxTokens,
-          temperature
-        }),
-
-        signal: controller.signal
-      }
-    );
-
-    clearTimeout(timeoutId);
-
-    if (!apiRes.ok) {
-      const errorText = await apiRes.text().catch(() => '');
-
-      console.error(
-        '[OpenRouter AI Error]',
-        apiRes.status,
-        errorText
-      );
-
-      const err = new Error(
-        `OpenRouter API error: ${apiRes.status}`
-      );
-
-      err.status = 503;
-      err.userMessage =
-        'Qwen AI service returned an error. Please try again.';
-
-      throw err;
-    }
-
-    const data = await apiRes.json().catch(() => null);
-
-    const rawContent = data?.choices?.[0]?.message?.content;
-    let generatedText = '';
-
-    if (typeof rawContent === 'string') {
-      generatedText = rawContent;
-    } else if (Array.isArray(rawContent)) {
-      generatedText = rawContent
-        .map(part => {
-          if (typeof part === 'string') return part;
-          if (part && typeof part === 'object' && typeof part.text === 'string') return part.text;
-          return '';
-        })
-        .filter(Boolean)
-        .join('\n');
-    }
-
-    if (!generatedText || typeof generatedText !== 'string' || !generatedText.trim()) {
-      const choice = data?.choices?.[0];
-      console.error(
-        '[OpenRouter AI] Invalid response content. Diagnostics:',
+  for (let attempt = 0; attempt < modelsToTry.length; attempt++) {
+    const currentModel = modelsToTry[attempt];
+    try {
+      const apiRes = await fetch(
+        apiUrl,
         {
-          finish_reason: choice?.finish_reason || 'N/A',
-          native_finish_reason: choice?.native_finish_reason || 'N/A',
-          messageKeys: choice?.message ? Object.keys(choice.message) : [],
-          model: data?.model || 'N/A'
+          method: 'POST',
+
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${apiKey}`,
+            'HTTP-Referer': 'https://quickr-vendors-friendly-mac.onrender.com',
+            'X-Title': 'QuickR'
+          },
+
+          body: JSON.stringify({
+            model: currentModel,
+
+            messages: [
+              {
+                role: 'user',
+                content: prompt
+              }
+            ],
+
+            max_tokens: maxTokens,
+            temperature
+          }),
+
+          signal: controller.signal
         }
       );
 
-      const err = new Error(
-        'OpenRouter returned an invalid response structure'
-      );
+      if (!apiRes.ok) {
+        const errorText = await apiRes.text().catch(() => '');
+        console.error(`[OpenRouter AI Error - Attempt ${attempt + 1} (${currentModel})]`, apiRes.status, errorText);
 
-      err.status = 503;
-      err.userMessage =
-        'Qwen AI returned an invalid response.';
+        // If error is 404, 429, or 503 and we have another model to try, continue to fallback
+        if ((apiRes.status === 404 || apiRes.status === 429 || apiRes.status === 503) && attempt < modelsToTry.length - 1) {
+          lastError = new Error(`OpenRouter API status ${apiRes.status} for ${currentModel}`);
+          continue;
+        }
 
-      throw err;
+        const err = new Error(
+          `OpenRouter API error: ${apiRes.status}`
+        );
+        err.status = 503;
+        err.userMessage =
+          'Qwen AI service returned an error. Please try again.';
+        throw err;
+      }
+
+      const data = await apiRes.json().catch(() => null);
+
+      const rawContent = data?.choices?.[0]?.message?.content;
+      let generatedText = '';
+
+      if (typeof rawContent === 'string') {
+        generatedText = rawContent;
+      } else if (Array.isArray(rawContent)) {
+        generatedText = rawContent
+          .map(part => {
+            if (typeof part === 'string') return part;
+            if (part && typeof part === 'object' && typeof part.text === 'string') return part.text;
+            return '';
+          })
+          .filter(Boolean)
+          .join('\n');
+      }
+
+      if (!generatedText || typeof generatedText !== 'string' || !generatedText.trim()) {
+        const choice = data?.choices?.[0];
+        console.error(
+          `[OpenRouter AI] Invalid response content (${currentModel}). Diagnostics:`,
+          {
+            finish_reason: choice?.finish_reason || 'N/A',
+            native_finish_reason: choice?.native_finish_reason || 'N/A',
+            messageKeys: choice?.message ? Object.keys(choice.message) : [],
+            model: data?.model || 'N/A'
+          }
+        );
+
+        if (attempt < modelsToTry.length - 1) {
+          lastError = new Error(`Empty content returned by ${currentModel}`);
+          continue;
+        }
+
+        const err = new Error(
+          'OpenRouter returned an invalid response structure'
+        );
+        err.status = 503;
+        err.userMessage =
+          'Qwen AI returned an invalid response.';
+        throw err;
+      }
+
+      clearTimeout(timeoutId);
+      return generatedText.trim();
+    } catch (err) {
+      if (err.name === 'AbortError') {
+        clearTimeout(timeoutId);
+        const timeoutErr = new Error('AI generation timed out');
+        timeoutErr.status = 504;
+        timeoutErr.userMessage = 'AI generation timed out. Please try again.';
+        throw timeoutErr;
+      }
+      if (attempt === modelsToTry.length - 1) {
+        clearTimeout(timeoutId);
+        throw err;
+      }
+      lastError = err;
     }
-
-    return generatedText.trim();
-
-  } catch (err) {
-    clearTimeout(timeoutId);
-
-    if (err.name === 'AbortError') {
-      const timeoutErr = new Error(
-        'AI generation timed out'
-      );
-
-      timeoutErr.status = 504;
-      timeoutErr.userMessage =
-        'AI generation timed out. Please try again.';
-
-      throw timeoutErr;
-    }
-
-    throw err;
   }
+
+  clearTimeout(timeoutId);
+  throw lastError || new Error('All AI model attempts failed');
 }
 
 // Protected endpoint: POST /api/ai/followup-message
@@ -165,32 +172,36 @@ router.post('/followup-message', requireAuth, async (req, res) => {
       followUpReason
     } = req.body || {};
 
-    const prompt = `You are a WhatsApp follow-up assistant for a clothing shop.
+    const prompt = `Generate ONLY the final WhatsApp message.
 
-Generate ONE short, natural WhatsApp follow-up message.
-
-Customer: ${customerName || 'Valued Customer'}
+Customer name: ${customerName || 'Valued Customer'}
 Product: ${productName || 'N/A'}
-Interest: ${interest || 'N/A'}
-Purchase status: ${purchaseStatus || 'N/A'}
-Follow-up reason: ${followUpReason || 'N/A'}
+Interest: ${interest || 'Interested'}
+Purchase status: ${purchaseStatus || "Didn't Purchase"}
+Follow-up reason: ${followUpReason || "Customer showed interest but hasn't purchased and enquiry received recently."}
 
 Rules:
-- Maximum 40 words.
-- Friendly and professional.
-- Use the customer's name.
-- Mention the product when available.
-- Do not invent discounts, offers, stock, availability, delivery dates, product details, or promises.
-- Do not use bullet points.
-- Do not pressure the customer.
-- Return ONLY the WhatsApp message.
-- Do not return explanations.
-- Do not return JSON.
-- Do not expose reasoning or thinking.`;
+- Maximum 40 words
+- Friendly and professional
+- Use customer's name
+- Mention the product when available
+- No invented discounts
+- No invented offers
+- No invented stock information
+- No invented availability
+- No invented delivery dates
+- No invented product details
+- No promises
+- No pressure
+- No bullet points
+- No headings
+- No quotation marks
+- No explanation
+- Return ONLY the WhatsApp message`;
 
     let generatedText;
     try {
-      generatedText = await generateAI(prompt, { maxTokens: 100, temperature: 0.7 });
+      generatedText = await generateAI(prompt, { maxTokens: 200, temperature: 0.7 });
     } catch (aiErr) {
       console.error('[AI Route - followup-message Error]:', aiErr.message);
       return res.status(aiErr.status || 503).json({
@@ -199,12 +210,48 @@ Rules:
       });
     }
 
-    let cleanedMessage = generatedText.trim();
+    let cleanedMessage = (generatedText || '').trim();
+
+    // Strip quotation marks surrounding the message
     if (
       (cleanedMessage.startsWith('"') && cleanedMessage.endsWith('"')) ||
       (cleanedMessage.startsWith("'") && cleanedMessage.endsWith("'"))
     ) {
       cleanedMessage = cleanedMessage.slice(1, -1).trim();
+    }
+
+    // Strip common prefixes
+    const prefixes = [
+      /^Suggested Message:\s*/i,
+      /^Message:\s*/i,
+      /^WhatsApp Message:\s*/i,
+      /^Here is the message:\s*/i,
+      /^WhatsApp follow-up message:\s*/i
+    ];
+    for (const prefix of prefixes) {
+      cleanedMessage = cleanedMessage.replace(prefix, '').trim();
+    }
+
+    // Remove any remaining surrounding quotes after prefix stripping
+    if (
+      (cleanedMessage.startsWith('"') && cleanedMessage.endsWith('"')) ||
+      (cleanedMessage.startsWith("'") && cleanedMessage.endsWith("'"))
+    ) {
+      cleanedMessage = cleanedMessage.slice(1, -1).trim();
+    }
+
+    // Ensure prompt text is never returned
+    if (cleanedMessage.includes('Generate ONLY') || cleanedMessage.includes('Rules:')) {
+      return res.status(503).json({
+        success: false,
+        error: 'AI generated invalid message content.'
+      });
+    }
+
+    // Enforce maximum 40 words
+    const words = cleanedMessage.split(/\s+/).filter(Boolean);
+    if (words.length > 40) {
+      cleanedMessage = words.slice(0, 40).join(' ');
     }
 
     if (!cleanedMessage) {
@@ -626,6 +673,157 @@ ${JSON.stringify(salesPayload, null, 2)}`;
   }
 });
 
+// Protected endpoint: POST /api/ai/followup-priorities
+router.post('/followup-priorities', requireAuth, async (req, res) => {
+  try {
+    let shopId = req.user?.shopId;
+    if (!shopId && req.user?.role === 'admin') {
+      if (req.body?.shopId) {
+        shopId = String(req.body.shopId).trim();
+      } else {
+        const firstShop = await Shop.findOne().lean();
+        if (firstShop) shopId = firstShop.customId;
+      }
+    }
+
+    if (!shopId) {
+      return res.status(403).json({
+        success: false,
+        error: 'Shop access required for AI Follow-Up Priorities.'
+      });
+    }
+
+    // Fetch active follow-ups, customers, and recent enquiries for shop
+    const activeFollowUps = await FollowUp.find({
+      shopId,
+      status: { $in: ['ready', 'scheduled', 'waiting', 'sent'] }
+    }).sort({ scheduledAt: 1 }).limit(20).lean();
+
+    const custIds = [...new Set(activeFollowUps.map(f => f.customerId))];
+    const enqIds = activeFollowUps.map(f => f.enquiryId).filter(Boolean);
+
+    const [customers, enquiries] = await Promise.all([
+      Customer.find({ shopId, id: { $in: custIds } }).lean(),
+      Enquiry.find({ shopId, id: { $in: enqIds } }).lean()
+    ]);
+
+    const custMap = new Map(customers.map(c => [c.id, c]));
+    const enqMap = new Map(enquiries.map(e => [e.id, e]));
+
+    const queuePayload = activeFollowUps.map(f => {
+      const cust = custMap.get(f.customerId);
+      const enq = enqMap.get(f.enquiryId);
+      return {
+        followUpId: f.id,
+        customerId: f.customerId,
+        customerName: cust?.name || 'Customer',
+        productName: enq?.productName || 'N/A',
+        scheduledAt: f.scheduledAt,
+        status: f.status,
+        reason: f.reason || 'Regular Follow-up',
+        purchaseStatus: enq?.purchaseStatus || 'Pending',
+        interestLevel: enq?.interest || 'Medium'
+      };
+    });
+
+    const prompt = `You are QuickR's AI Follow-Up Priority Assistant for a retail shop.
+
+Analyze the queue of active customer follow-ups and prioritize them based on urgency, recent activity, overdue status, customer interest, and purchase potential.
+
+Do NOT invent purchases, discounts, stock, offers, customer info, or dates.
+
+RETURN VALID JSON ONLY:
+
+{
+  "priorities": [
+    {
+      "followUpId": "ID",
+      "priority": "HIGH|MEDIUM|LOW",
+      "urgencyReason": "Short explanation based only on supplied data."
+    }
+  ]
+}
+
+Data:
+FOLLOW-UP QUEUE:
+${JSON.stringify(queuePayload, null, 2)}`;
+
+    let generatedText;
+    try {
+      generatedText = await generateAI(prompt, { maxTokens: 400, temperature: 0.2 });
+    } catch (aiErr) {
+      console.error('[AI Follow-Up Priorities Error]:', aiErr.message);
+      return res.status(aiErr.status || 503).json({
+        success: false,
+        error: aiErr.userMessage || 'AI follow-up priority service is currently unavailable.'
+      });
+    }
+
+    let rawText = generatedText.trim();
+    if (rawText.startsWith('```')) {
+      rawText = rawText.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
+    }
+
+    const jsonMatch = rawText.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      rawText = jsonMatch[0];
+    }
+
+    let parsedJson;
+    try {
+      parsedJson = JSON.parse(rawText);
+    } catch (parseErr) {
+      console.error('[AI Follow-Up Priorities] Failed to parse JSON response:', rawText);
+      return res.status(500).json({
+        success: false,
+        error: 'AI returned an invalid follow-up priority result.'
+      });
+    }
+
+    const priorityMap = new Map();
+    if (Array.isArray(parsedJson.priorities)) {
+      parsedJson.priorities.forEach(p => {
+        if (p.followUpId) {
+          priorityMap.set(p.followUpId, {
+            priority: ['HIGH', 'MEDIUM', 'LOW'].includes(p.priority) ? p.priority : 'MEDIUM',
+            urgencyReason: typeof p.urgencyReason === 'string' ? p.urgencyReason : 'Scheduled follow-up.'
+          });
+        }
+      });
+    }
+
+    const prioritizedQueue = queuePayload.map(item => {
+      const aiPrio = priorityMap.get(item.followUpId);
+      const prio = aiPrio?.priority || 'MEDIUM';
+      const score = prio === 'HIGH' ? 85 : prio === 'MEDIUM' ? 60 : 35;
+      const lead = prio === 'HIGH' ? 'HOT' : prio === 'MEDIUM' ? 'WARM' : 'COLD';
+      const act = prio === 'HIGH' ? 'Contact customer today' : 'Follow up as scheduled';
+      const resn = aiPrio?.urgencyReason || 'Regular scheduled follow-up.';
+      return {
+        ...item,
+        priorityScore: score,
+        leadLevel: lead,
+        recommendedAction: act,
+        reason: resn,
+        priority: prio,
+        urgencyReason: resn
+      };
+    });
+
+    return res.json({
+      success: true,
+      priorities: prioritizedQueue
+    });
+
+  } catch (err) {
+    console.error('[AI Follow-Up Priorities] Unexpected internal error:', err);
+    return res.status(500).json({
+      success: false,
+      error: 'AI service is currently unavailable.'
+    });
+  }
+});
+
 // Protected endpoint: POST /api/ai/shop-insights
 router.post('/shop-insights', requireAuth, async (req, res) => {
   try {
@@ -758,7 +956,7 @@ ${JSON.stringify(recentSalesPayload, null, 2)}`;
 
     let generatedText;
     try {
-      generatedText = await generateAI(prompt, { maxTokens: 400, temperature: 0.2 });
+      generatedText = await generateAI(prompt, { maxTokens: 600, temperature: 0.2 });
     } catch (aiErr) {
       console.error('[AI Shop Insights Error]:', aiErr.message);
       return res.status(aiErr.status || 503).json({

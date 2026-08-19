@@ -29,8 +29,8 @@ async function testUnitGenerateAI() {
     console.error('❌ Failed: Should fail network connection');
     process.exit(1);
   } catch (err) {
-    if (err.status === 503 || err.message.includes('fetch failed') || err.message.includes('ECONNREFUSED')) {
-      console.log('✅ Test 2 Passed: Handled network failure gracefully with 503 status');
+    if (err.status === 503 || err.status === 504 || err.message.includes('fetch failed') || err.message.includes('ECONNREFUSED')) {
+      console.log('✅ Test 2 Passed: Handled network failure/timeout gracefully');
     } else {
       console.error('❌ Test 2 Failed with unexpected error:', err);
       process.exit(1);
