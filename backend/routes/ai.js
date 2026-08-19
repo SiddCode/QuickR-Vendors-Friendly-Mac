@@ -8,6 +8,133 @@ import { Sale } from '../models/Sale.js';
 
 const router = express.Router();
 
+// Helper: Call OpenRouter API with Qwen model, timeout, max output tokens, temperature, and error handling
+export async function generateAI(prompt, options = {}) {
+  const apiKey = process.env.QWEN_API_KEY;
+
+  if (!apiKey || !String(apiKey).trim()) {
+    const err = new Error(
+      'QWEN_API_KEY environment variable is not configured'
+    );
+
+    err.status = 503;
+    err.userMessage =
+      'QWEN_API_KEY is missing. Please configure it on the server.';
+
+    throw err;
+  }
+
+  const {
+    maxTokens = 300,
+    temperature = 0.7,
+    timeoutMs = 60000
+  } = options;
+
+  const controller = new AbortController();
+
+  const timeoutId = setTimeout(() => {
+    controller.abort();
+  }, timeoutMs);
+
+  try {
+    const apiRes = await fetch(
+      'https://openrouter.ai/api/v1/chat/completions',
+      {
+        method: 'POST',
+
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${apiKey}`,
+          'HTTP-Referer': 'https://quickr-vendors-friendly-mac.onrender.com',
+          'X-Title': 'QuickR'
+        },
+
+        body: JSON.stringify({
+          model: 'qwen/qwen-plus',
+
+          messages: [
+            {
+              role: 'user',
+              content: prompt
+            }
+          ],
+
+          max_tokens: maxTokens,
+          temperature
+        }),
+
+        signal: controller.signal
+      }
+    );
+
+    clearTimeout(timeoutId);
+
+    if (!apiRes.ok) {
+      const errorText = await apiRes.text().catch(() => '');
+
+      console.error(
+        '[OpenRouter AI Error]',
+        apiRes.status,
+        errorText
+      );
+
+      const err = new Error(
+        `OpenRouter API error: ${apiRes.status}`
+      );
+
+      err.status = 503;
+      err.userMessage =
+        'Qwen AI service returned an error. Please try again.';
+
+      throw err;
+    }
+
+    const data = await apiRes.json().catch(() => null);
+
+    const generatedText =
+      data?.choices?.[0]?.message?.content;
+
+    if (
+      !generatedText ||
+      typeof generatedText !== 'string'
+    ) {
+      console.error(
+        '[OpenRouter AI] Invalid response:',
+        data
+      );
+
+      const err = new Error(
+        'OpenRouter returned an invalid response structure'
+      );
+
+      err.status = 503;
+      err.userMessage =
+        'Qwen AI returned an invalid response.';
+
+      throw err;
+    }
+
+    return generatedText.trim();
+
+  } catch (err) {
+    clearTimeout(timeoutId);
+
+    if (err.name === 'AbortError') {
+      const timeoutErr = new Error(
+        'AI generation timed out'
+      );
+
+      timeoutErr.status = 504;
+      timeoutErr.userMessage =
+        'AI generation timed out. Please try again.';
+
+      throw timeoutErr;
+    }
+
+    throw err;
+  }
+}
+
 // Protected endpoint: POST /api/ai/followup-message
 router.post('/followup-message', requireAuth, async (req, res) => {
   try {
@@ -42,131 +169,31 @@ Rules:
 - Do not return JSON.
 - Do not expose reasoning or thinking.`;
 
-    console.log('[AI Route] Sending request to Ollama...');
-
-    const controller = new AbortController();
-
-    // Allow local Qwen enough time to generate
-    const timeoutId = setTimeout(() => {
-      controller.abort();
-    }, 120000);
-
-    let ollamaRes;
-
+    let generatedText;
     try {
-      ollamaRes = await fetch(
-        'http://127.0.0.1:11434/api/generate',
-        {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json'
-          },
-          body: JSON.stringify({
-            model: 'qwen3:4b-instruct',
-            prompt,
-            stream: false,
-            think: false,
-            options: {
-              num_predict: 100,
-              temperature: 0.7
-            }
-          }),
-          signal: controller.signal
-        }
-      );
-    } catch (err) {
-      console.error('[AI Route] Ollama error:', {
-        name: err.name,
-        message: err.message,
-        cause: err.cause?.message || err.cause?.code || null
-      });
-
-      clearTimeout(timeoutId);
-
-      if (err.name === 'AbortError') {
-        return res.status(504).json({
-          success: false,
-          error: 'AI generation timed out. Please try again.'
-        });
-      }
-
-      return res.status(503).json({
+      generatedText = await generateAI(prompt, { maxTokens: 100, temperature: 0.7 });
+    } catch (aiErr) {
+      console.error('[AI Route - followup-message Error]:', aiErr.message);
+      return res.status(aiErr.status || 503).json({
         success: false,
-        error: 'Unable to connect to local AI.'
+        error: aiErr.userMessage || 'AI generation service is currently unavailable.'
       });
     }
 
-    clearTimeout(timeoutId);
-
-    console.log(
-      '[AI Route] Ollama response status:',
-      ollamaRes.status
-    );
-
-    if (!ollamaRes.ok) {
-      const errorText = await ollamaRes.text().catch(() => '');
-
-      console.error(
-        '[AI Route] Ollama returned error:',
-        ollamaRes.status,
-        errorText
-      );
-
-      return res.status(503).json({
-        success: false,
-        error: 'Local AI returned an error.'
-      });
-    }
-
-    const data = await ollamaRes.json().catch(err => {
-      console.error(
-        '[AI Route] JSON parse error:',
-        err.message
-      );
-
-      return null;
-    });
-
-    if (!data || typeof data.response !== 'string') {
-      console.error(
-        '[AI Route] Ollama returned invalid response:',
-        data
-      );
-
-      return res.status(503).json({
-        success: false,
-        error: 'Local AI returned an invalid response.'
-      });
-    }
-
-    let cleanedMessage = data.response.trim();
-
-    // Remove surrounding quotes if Qwen adds them
+    let cleanedMessage = generatedText.trim();
     if (
-      (cleanedMessage.startsWith('"') &&
-        cleanedMessage.endsWith('"')) ||
-      (cleanedMessage.startsWith("'") &&
-        cleanedMessage.endsWith("'"))
+      (cleanedMessage.startsWith('"') && cleanedMessage.endsWith('"')) ||
+      (cleanedMessage.startsWith("'") && cleanedMessage.endsWith("'"))
     ) {
-      cleanedMessage = cleanedMessage
-        .slice(1, -1)
-        .trim();
+      cleanedMessage = cleanedMessage.slice(1, -1).trim();
     }
 
     if (!cleanedMessage) {
-      console.error(
-        '[AI Route] Ollama returned an empty message.'
-      );
-
       return res.status(503).json({
         success: false,
         error: 'AI generated an empty message.'
       });
     }
-
-    console.log(
-      '[AI Route] AI message generated successfully.'
-    );
 
     return res.json({
       success: true,
@@ -174,14 +201,10 @@ Rules:
     });
 
   } catch (err) {
-    console.error(
-      '[AI Route] Internal server error:',
-      err
-    );
-
+    console.error('[AI Route] Internal server error:', err);
     return res.status(500).json({
       success: false,
-      error: 'Local AI is currently unavailable.'
+      error: 'AI generation service is currently unavailable.'
     });
   }
 });
@@ -331,62 +354,19 @@ ${JSON.stringify(followUpsPayload, null, 2)}
 SALES:
 ${JSON.stringify(salesPayload, null, 2)}`;
 
-    console.log('[AI Intelligence] Sending request to Ollama for customer:', customerId);
-
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 120000);
-
-    let ollamaRes;
+    let generatedText;
     try {
-      ollamaRes = await fetch('http://127.0.0.1:11434/api/generate', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: 'qwen3:4b-instruct',
-          prompt,
-          stream: false,
-          think: false,
-          options: {
-            num_predict: 150,
-            temperature: 0.2
-          }
-        }),
-        signal: controller.signal
-      });
-    } catch (err) {
-      clearTimeout(timeoutId);
-      console.error('[AI Intelligence] Ollama connection error:', err.message);
-      return res.status(503).json({
+      generatedText = await generateAI(prompt, { maxTokens: 250, temperature: 0.2 });
+    } catch (aiErr) {
+      console.error('[AI Intelligence Error]:', aiErr.message);
+      return res.status(aiErr.status || 503).json({
         success: false,
-        error: 'Local AI is currently unavailable.'
-      });
-    }
-
-    clearTimeout(timeoutId);
-
-    if (!ollamaRes.ok) {
-      console.error('[AI Intelligence] Ollama response not OK:', ollamaRes.status);
-      return res.status(503).json({
-        success: false,
-        error: 'Local AI is currently unavailable.'
-      });
-    }
-
-    const data = await ollamaRes.json().catch(err => {
-      console.error('[AI Intelligence] Response JSON parse error:', err.message);
-      return null;
-    });
-
-    if (!data || typeof data.response !== 'string') {
-      console.error('[AI Intelligence] Invalid data.response from Ollama:', data);
-      return res.status(503).json({
-        success: false,
-        error: 'Local AI returned an invalid response.'
+        error: aiErr.userMessage || 'AI customer intelligence service is currently unavailable.'
       });
     }
 
     // Strip markdown code fences if present (e.g., ```json ... ```)
-    let rawText = data.response.trim();
+    let rawText = generatedText.trim();
     if (rawText.startsWith('```')) {
       rawText = rawText.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
     }
@@ -433,7 +413,7 @@ ${JSON.stringify(salesPayload, null, 2)}`;
     console.error('[AI Intelligence] Unexpected internal error:', err);
     return res.status(500).json({
       success: false,
-      error: 'Local AI is currently unavailable.'
+      error: 'AI service is currently unavailable.'
     });
   }
 });
@@ -482,8 +462,11 @@ router.post('/sales-opportunity', requireAuth, async (req, res) => {
 
     const customerPayload = {
       name: customer.name,
+      preferences: customer.preferences || {},
       totalPurchases: customer.totalPurchases || 0,
-      totalSpending: customer.totalSpending || 0
+      totalSpending: customer.totalSpending || 0,
+      conversionRate: customer.conversionRate || 0,
+      status: customer.status || 'Active'
     };
 
     const enquiriesPayload = enquiries.map(e => ({
@@ -562,61 +545,18 @@ ${JSON.stringify(followUpsPayload, null, 2)}
 SALES:
 ${JSON.stringify(salesPayload, null, 2)}`;
 
-    console.log('[AI Sales Opportunity] Sending request to Ollama for customer:', customerId);
-
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 120000);
-
-    let ollamaRes;
+    let generatedText;
     try {
-      ollamaRes = await fetch('http://127.0.0.1:11434/api/generate', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: 'qwen3:4b-instruct',
-          prompt,
-          stream: false,
-          think: false,
-          options: {
-            num_predict: 150,
-            temperature: 0.2
-          }
-        }),
-        signal: controller.signal
-      });
-    } catch (err) {
-      clearTimeout(timeoutId);
-      console.error('[AI Sales Opportunity] Ollama connection error:', err.message);
-      return res.status(503).json({
+      generatedText = await generateAI(prompt, { maxTokens: 250, temperature: 0.2 });
+    } catch (aiErr) {
+      console.error('[AI Sales Opportunity Error]:', aiErr.message);
+      return res.status(aiErr.status || 503).json({
         success: false,
-        error: 'Local AI is currently unavailable.'
+        error: aiErr.userMessage || 'AI sales opportunity service is currently unavailable.'
       });
     }
 
-    clearTimeout(timeoutId);
-
-    if (!ollamaRes.ok) {
-      console.error('[AI Sales Opportunity] Ollama status not OK:', ollamaRes.status);
-      return res.status(503).json({
-        success: false,
-        error: 'Local AI is currently unavailable.'
-      });
-    }
-
-    const data = await ollamaRes.json().catch(err => {
-      console.error('[AI Sales Opportunity] JSON parse error:', err.message);
-      return null;
-    });
-
-    if (!data || typeof data.response !== 'string') {
-      return res.status(503).json({
-        success: false,
-        error: 'Local AI is currently unavailable.'
-      });
-    }
-
-    // Strip markdown code fences
-    let rawText = data.response.trim();
+    let rawText = generatedText.trim();
     if (rawText.startsWith('```')) {
       rawText = rawText.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
     }
@@ -630,23 +570,22 @@ ${JSON.stringify(salesPayload, null, 2)}`;
     try {
       parsedJson = JSON.parse(rawText);
     } catch (parseErr) {
-      console.error('[AI Sales Opportunity] Failed to parse Qwen JSON:', rawText);
+      console.error('[AI Sales Opportunity] Failed to parse Qwen JSON response:', rawText);
       return res.status(500).json({
         success: false,
         error: 'AI returned an invalid sales opportunity result.'
       });
     }
 
-    const rawScore = parseInt(parsedJson.opportunityScore, 10);
-    const opportunityScore = !isNaN(rawScore) ? Math.max(0, Math.min(100, rawScore)) : 50;
-
     const validLeadLevels = ['HOT', 'WARM', 'COLD', 'LOW_PRIORITY'];
     const validTimings = ['TODAY', 'TOMORROW', 'WITHIN_3_DAYS', 'WAIT', 'NO_FOLLOW_UP'];
 
-    const leadLevel = validLeadLevels.includes(parsedJson.leadLevel) ? parsedJson.leadLevel : (opportunityScore >= 75 ? 'HOT' : opportunityScore >= 45 ? 'WARM' : 'COLD');
-    const recommendedAction = typeof parsedJson.recommendedAction === 'string' && parsedJson.recommendedAction ? parsedJson.recommendedAction : 'Follow up with the customer.';
+    const rawScore = Number(parsedJson.opportunityScore);
+    const opportunityScore = !isNaN(rawScore) ? Math.min(100, Math.max(0, Math.round(rawScore))) : 50;
+    const leadLevel = validLeadLevels.includes(parsedJson.leadLevel) ? parsedJson.leadLevel : 'WARM';
+    const recommendedAction = typeof parsedJson.recommendedAction === 'string' && parsedJson.recommendedAction ? parsedJson.recommendedAction : 'Follow up with customer.';
     const recommendedTiming = validTimings.includes(parsedJson.recommendedTiming) ? parsedJson.recommendedTiming : 'TOMORROW';
-    const reason = typeof parsedJson.reason === 'string' && parsedJson.reason ? parsedJson.reason : 'Based on recent customer activity.';
+    const reason = typeof parsedJson.reason === 'string' && parsedJson.reason ? parsedJson.reason : 'Based on customer enquiry and sales history.';
 
     return res.json({
       success: true,
@@ -663,7 +602,7 @@ ${JSON.stringify(salesPayload, null, 2)}`;
     console.error('[AI Sales Opportunity] Unexpected internal error:', err);
     return res.status(500).json({
       success: false,
-      error: 'Local AI is currently unavailable.'
+      error: 'AI service is currently unavailable.'
     });
   }
 });
@@ -671,7 +610,10 @@ ${JSON.stringify(salesPayload, null, 2)}`;
 // Protected endpoint: POST /api/ai/shop-insights
 router.post('/shop-insights', requireAuth, async (req, res) => {
   try {
-    const shopId = req.user?.shopId;
+    let shopId = req.user?.shopId;
+    if (!shopId && req.user?.role === 'admin' && req.body?.shopId) {
+      shopId = String(req.body.shopId).trim();
+    }
 
     if (!shopId) {
       return res.status(403).json({
@@ -680,72 +622,44 @@ router.post('/shop-insights', requireAuth, async (req, res) => {
       });
     }
 
-    // Exact pre-calculated statistics scoped to shopId
-    const [
-      totalCustomers,
-      totalEnquiries,
-      purchasedEnquiries,
-      notPurchasedEnquiries,
-      interestedEnquiries,
-      notInterestedEnquiries,
-      totalFollowUps,
-      completedFollowUps,
-      pendingFollowUps,
-      salesDocs,
-      recentEnquiries,
-      recentFollowUps,
-      recentSales
-    ] = await Promise.all([
+    const shop = await Shop.findOne({ customId: shopId });
+    if (!shop) {
+      return res.status(404).json({
+        success: false,
+        error: 'Shop not found.'
+      });
+    }
+
+    const [customersCount, enquiriesCount, followUpsCount, salesDocs] = await Promise.all([
       Customer.countDocuments({ shopId }),
       Enquiry.countDocuments({ shopId }),
-      Enquiry.countDocuments({ shopId, purchaseStatus: 'Purchased' }),
-      Enquiry.countDocuments({ shopId, purchaseStatus: "Didn't Purchase" }),
-      Enquiry.countDocuments({ shopId, interest: { $in: ['Interested', 'Very Interested'] } }),
-      Enquiry.countDocuments({ shopId, interest: 'Just Enquiring' }),
       FollowUp.countDocuments({ shopId }),
-      FollowUp.countDocuments({ shopId, status: 'completed' }),
-      FollowUp.countDocuments({ shopId, status: { $in: ['ready', 'scheduled', 'waiting'] } }),
-      Sale.find({ shopId }).lean(),
+      Sale.find({ shopId }).lean()
+    ]);
+
+    const purchasedEnquiriesCount = await Enquiry.countDocuments({ shopId, purchaseStatus: 'Purchased' });
+    const notPurchasedEnquiriesCount = await Enquiry.countDocuments({ shopId, purchaseStatus: "Didn't Purchase" });
+    const pendingFollowUpsCount = await FollowUp.countDocuments({ shopId, status: { $in: ['ready', 'scheduled', 'waiting'] } });
+    const totalSalesAmount = salesDocs.reduce((sum, s) => sum + (s.totalAmount || 0), 0);
+    const conversionRate = enquiriesCount > 0 ? Number(((purchasedEnquiriesCount / enquiriesCount) * 100).toFixed(1)) : 0;
+
+    const [recentEnquiries, recentFollowUps, recentSales] = await Promise.all([
       Enquiry.find({ shopId }).sort({ createdAt: -1 }).limit(10).lean(),
       FollowUp.find({ shopId }).sort({ createdAt: -1 }).limit(10).lean(),
       Sale.find({ shopId }).sort({ createdAt: -1 }).limit(10).lean()
     ]);
 
-    const totalSales = salesDocs.length;
-    const totalSalesAmount = salesDocs.reduce((sum, s) => sum + (s.totalAmount || 0), 0);
-
-    // Product insights calculation if available
-    const productStatsMap = {};
-    salesDocs.forEach(s => {
-      (s.items || []).forEach(item => {
-        if (item.productName) {
-          if (!productStatsMap[item.productName]) {
-            productStatsMap[item.productName] = { purchaseCount: 0, salesAmount: 0 };
-          }
-          productStatsMap[item.productName].purchaseCount += item.quantity || 1;
-          productStatsMap[item.productName].salesAmount += item.total || 0;
-        }
-      });
-    });
-
-    const topProducts = Object.entries(productStatsMap)
-      .map(([productName, stat]) => ({ productName, ...stat }))
-      .sort((a, b) => b.salesAmount - a.salesAmount)
-      .slice(0, 5);
-
     const statsPayload = {
-      totalCustomers,
-      totalEnquiries,
-      purchasedEnquiries,
-      notPurchasedEnquiries,
-      interestedEnquiries,
-      notInterestedEnquiries,
-      totalFollowUps,
-      completedFollowUps,
-      pendingFollowUps,
-      totalSales,
+      shopName: shop.name,
+      customersCount,
+      enquiriesCount,
+      purchasedEnquiriesCount,
+      notPurchasedEnquiriesCount,
+      followUpsCount,
+      pendingFollowUpsCount,
+      salesCount: salesDocs.length,
       totalSalesAmount,
-      topProducts
+      conversionRate
     };
 
     const recentEnquiriesPayload = recentEnquiries.map(e => ({
@@ -823,61 +737,18 @@ ${JSON.stringify(recentFollowUpsPayload, null, 2)}
 RECENT SALES:
 ${JSON.stringify(recentSalesPayload, null, 2)}`;
 
-    console.log('[AI Shop Insights] Sending request to Ollama for shopId:', shopId);
-
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 120000);
-
-    let ollamaRes;
+    let generatedText;
     try {
-      ollamaRes = await fetch('http://127.0.0.1:11434/api/generate', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: 'qwen3:4b-instruct',
-          prompt,
-          stream: false,
-          think: false,
-          options: {
-            num_predict: 300,
-            temperature: 0.2
-          }
-        }),
-        signal: controller.signal
-      });
-    } catch (err) {
-      clearTimeout(timeoutId);
-      console.error('[AI Shop Insights] Ollama connection error:', err.message);
-      return res.status(503).json({
+      generatedText = await generateAI(prompt, { maxTokens: 400, temperature: 0.2 });
+    } catch (aiErr) {
+      console.error('[AI Shop Insights Error]:', aiErr.message);
+      return res.status(aiErr.status || 503).json({
         success: false,
-        error: 'Local AI is currently unavailable.'
+        error: aiErr.userMessage || 'AI shop insights service is currently unavailable.'
       });
     }
 
-    clearTimeout(timeoutId);
-
-    if (!ollamaRes.ok) {
-      console.error('[AI Shop Insights] Ollama status not OK:', ollamaRes.status);
-      return res.status(503).json({
-        success: false,
-        error: 'Local AI is currently unavailable.'
-      });
-    }
-
-    const data = await ollamaRes.json().catch(err => {
-      console.error('[AI Shop Insights] JSON parse error:', err.message);
-      return null;
-    });
-
-    if (!data || typeof data.response !== 'string') {
-      return res.status(503).json({
-        success: false,
-        error: 'Local AI is currently unavailable.'
-      });
-    }
-
-    // Strip markdown code fences
-    let rawText = data.response.trim();
+    let rawText = generatedText.trim();
     if (rawText.startsWith('```')) {
       rawText = rawText.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
     }
@@ -898,20 +769,18 @@ ${JSON.stringify(recentSalesPayload, null, 2)}`;
       });
     }
 
-    const validTypes = ['SALES_OPPORTUNITY', 'PRODUCT', 'FOLLOW_UP', 'CUSTOMER', 'CONVERSION', 'GENERAL'];
-
-    const summary = typeof parsedJson.summary === 'string' && parsedJson.summary ? parsedJson.summary : `Shop performance summary: ${totalSales} sales completed with ₹${totalSalesAmount} total revenue.`;
+    const validInsightTypes = ['SALES_OPPORTUNITY', 'PRODUCT', 'FOLLOW_UP', 'CUSTOMER', 'CONVERSION', 'GENERAL'];
+    const summary = typeof parsedJson.summary === 'string' && parsedJson.summary ? parsedJson.summary : 'Shop activity overview.';
 
     const insights = Array.isArray(parsedJson.insights)
-      ? parsedJson.insights.slice(0, 4).map(item => ({
-          type: validTypes.includes(item.type) ? item.type : 'GENERAL',
-          title: typeof item.title === 'string' && item.title ? item.title : 'Shop Activity Insight',
-          description: typeof item.description === 'string' && item.description ? item.description : 'Activity trend observed in recent shop data.'
+      ? parsedJson.insights.slice(0, 4).map(i => ({
+          type: validInsightTypes.includes(i.type) ? i.type : 'GENERAL',
+          title: typeof i.title === 'string' && i.title ? i.title : 'Shop Observation',
+          description: typeof i.description === 'string' && i.description ? i.description : 'Based on recent shop activity.'
         }))
       : [];
 
     const forbiddenKeywords = ['discount', 'special offer', 'promotion', 'price change', 'stock availability', 'delivery promise', 'product change'];
-
     const rawRecommendations = Array.isArray(parsedJson.recommendations) ? parsedJson.recommendations : [];
 
     const sanitizedRecommendations = rawRecommendations
@@ -923,9 +792,9 @@ ${JSON.stringify(recentSalesPayload, null, 2)}`;
       .slice(0, 3);
 
     const safeDefaults = [
-      'Follow up with interested customers today.',
-      'Review pending follow-ups to ensure timely engagement.',
-      'Monitor product enquiry activity and conversion trends.'
+      'Review pending follow-ups with interested customers.',
+      'Monitor enquiry conversion rates for popular product categories.',
+      'Maintain regular customer communication.'
     ];
 
     while (sanitizedRecommendations.length < 3) {
@@ -951,39 +820,16 @@ ${JSON.stringify(recentSalesPayload, null, 2)}`;
     console.error('[AI Shop Insights] Unexpected internal error:', err);
     return res.status(500).json({
       success: false,
-      error: 'Local AI is currently unavailable.'
+      error: 'AI service is currently unavailable.'
     });
   }
 });
 
-// Protected endpoint: POST /api/ai/admin-insights (ADMIN ONLY)
+// Protected admin endpoint: POST /api/ai/admin-insights
 router.post('/admin-insights', requireAuth, requireAdmin, async (req, res) => {
   try {
-    if (req.user?.role !== 'admin') {
-      return res.status(403).json({
-        success: false,
-        error: 'Admin access required.'
-      });
-    }
-
-    // 1. Authoritative Platform Totals directly from MongoDB
-    const [
-      totalShops,
-      activeShops,
-      disabledShops,
-      totalCustomers,
-      totalEnquiries,
-      totalPurchasedEnquiries,
-      totalNotPurchasedEnquiries,
-      totalFollowUps,
-      pendingFollowUps,
-      completedFollowUps,
-      allSalesDocs,
-      allShops
-    ] = await Promise.all([
-      Shop.countDocuments(),
-      Shop.countDocuments({ status: { $ne: 'disabled' } }),
-      Shop.countDocuments({ status: 'disabled' }),
+    const [allShops, totalCustomers, totalEnquiries, totalPurchasedEnquiries, totalNotPurchasedEnquiries, totalFollowUps, pendingFollowUps, completedFollowUps, salesDocs] = await Promise.all([
+      Shop.find().lean(),
       Customer.countDocuments(),
       Enquiry.countDocuments(),
       Enquiry.countDocuments({ purchaseStatus: 'Purchased' }),
@@ -991,12 +837,15 @@ router.post('/admin-insights', requireAuth, requireAdmin, async (req, res) => {
       FollowUp.countDocuments(),
       FollowUp.countDocuments({ status: { $in: ['ready', 'scheduled', 'waiting'] } }),
       FollowUp.countDocuments({ status: 'completed' }),
-      Sale.find().lean(),
-      Shop.find().lean()
+      Sale.find().lean()
     ]);
 
-    const totalSales = allSalesDocs.length;
-    const totalSalesAmount = allSalesDocs.reduce((sum, s) => sum + (s.totalAmount || 0), 0);
+    const totalShops = allShops.length;
+    const activeShops = allShops.filter(s => s.status !== 'disabled').length;
+    const disabledShops = totalShops - activeShops;
+
+    const totalSales = salesDocs.length;
+    const totalSalesAmount = salesDocs.reduce((sum, s) => sum + (s.totalAmount || 0), 0);
 
     const stats = {
       totalShops,
@@ -1013,7 +862,6 @@ router.post('/admin-insights', requireAuth, requireAdmin, async (req, res) => {
       totalSalesAmount
     };
 
-    // 2. Aggregated Shop-Level Performance
     const shopPerformance = await Promise.all(
       allShops.map(async (shop) => {
         const sId = shop.customId;
@@ -1041,7 +889,6 @@ router.post('/admin-insights', requireAuth, requireAdmin, async (req, res) => {
       })
     );
 
-    // Limit shop performance payload sent to Qwen to active/top 10 shops to avoid token bloat
     const condensedShopPerformance = shopPerformance
       .sort((a, b) => (b.salesAmount + b.enquiries) - (a.salesAmount + a.enquiries))
       .slice(0, 10)
@@ -1055,7 +902,6 @@ router.post('/admin-insights', requireAuth, requireAdmin, async (req, res) => {
         conversionRate: s.conversionRate
       }));
 
-    // 3. Backend Shop Rankings
     const topShopsBySales = [...shopPerformance].sort((a, b) => b.salesAmount - a.salesAmount).slice(0, 3);
     const topShopsByConversion = [...shopPerformance].sort((a, b) => b.conversionRate - a.conversionRate).slice(0, 3);
     const highestPendingFollowups = [...shopPerformance].sort((a, b) => b.pendingFollowUps - a.pendingFollowUps).slice(0, 3);
@@ -1113,61 +959,18 @@ ${JSON.stringify(condensedShopPerformance, null, 2)}
 RANKINGS & HIGHLIGHTS:
 ${JSON.stringify(rankingPayload, null, 2)}`;
 
-    console.log('[AI Admin Insights] Sending request to Ollama...');
-
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 120000);
-
-    let ollamaRes;
+    let generatedText;
     try {
-      ollamaRes = await fetch('http://127.0.0.1:11434/api/generate', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: 'qwen3:4b-instruct',
-          prompt,
-          stream: false,
-          think: false,
-          options: {
-            num_predict: 500,
-            temperature: 0.2
-          }
-        }),
-        signal: controller.signal
-      });
-    } catch (err) {
-      clearTimeout(timeoutId);
-      console.error('[AI Admin Insights] Ollama connection error:', err.message);
-      return res.status(503).json({
+      generatedText = await generateAI(prompt, { maxTokens: 500, temperature: 0.2 });
+    } catch (aiErr) {
+      console.error('[AI Admin Insights Error]:', aiErr.message);
+      return res.status(aiErr.status || 503).json({
         success: false,
-        error: 'Local AI is currently unavailable.'
+        error: aiErr.userMessage || 'AI admin insights service is currently unavailable.'
       });
     }
 
-    clearTimeout(timeoutId);
-
-    if (!ollamaRes.ok) {
-      console.error('[AI Admin Insights] Ollama status not OK:', ollamaRes.status);
-      return res.status(503).json({
-        success: false,
-        error: 'Local AI is currently unavailable.'
-      });
-    }
-
-    const data = await ollamaRes.json().catch(err => {
-      console.error('[AI Admin Insights] JSON parse error:', err.message);
-      return null;
-    });
-
-    if (!data || typeof data.response !== 'string') {
-      return res.status(503).json({
-        success: false,
-        error: 'Local AI is currently unavailable.'
-      });
-    }
-
-    // Strip markdown code fences
-    let rawText = data.response.trim();
+    let rawText = generatedText.trim();
     if (rawText.startsWith('```')) {
       rawText = rawText.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
     }
@@ -1181,48 +984,25 @@ ${JSON.stringify(rankingPayload, null, 2)}`;
     try {
       parsedJson = JSON.parse(rawText);
     } catch (parseErr) {
-      // Attempt JSON repair if truncated at recommendations array
-      if (rawText.includes('"insights":') && !rawText.endsWith('}')) {
-        let repaired = rawText;
-        if (!repaired.includes('"recommendations":')) {
-          repaired += ',\n"recommendations": []\n}';
-        } else if (!repaired.endsWith(']')) {
-          repaired += '"]\n}';
-        } else {
-          repaired += '\n}';
-        }
-        try {
-          parsedJson = JSON.parse(repaired);
-        } catch (rErr) {
-          console.error('[AI Admin Insights] Failed to parse Qwen JSON after repair attempt:', rawText);
-          return res.status(500).json({
-            success: false,
-            error: 'AI returned an invalid admin insights result.'
-          });
-        }
-      } else {
-        console.error('[AI Admin Insights] Failed to parse Qwen JSON:', rawText);
-        return res.status(500).json({
-          success: false,
-          error: 'AI returned an invalid admin insights result.'
-        });
-      }
+      console.error('[AI Admin Insights] Failed to parse Qwen JSON:', rawText);
+      return res.status(500).json({
+        success: false,
+        error: 'AI returned an invalid admin insights result.'
+      });
     }
 
-    const validTypes = ['TOP_PERFORMER', 'ATTENTION', 'OPPORTUNITY', 'CONVERSION', 'FOLLOW_UP', 'SALES', 'GENERAL'];
-
-    const summary = typeof parsedJson.summary === 'string' && parsedJson.summary ? parsedJson.summary : `Platform summary: ${totalShops} shops registered with ₹${totalSalesAmount} total sales volume across ${totalSales} orders.`;
+    const validInsightTypes = ['TOP_PERFORMER', 'ATTENTION', 'OPPORTUNITY', 'CONVERSION', 'FOLLOW_UP', 'SALES', 'GENERAL'];
+    const summary = typeof parsedJson.summary === 'string' && parsedJson.summary ? parsedJson.summary : 'Global platform performance summary.';
 
     const insights = Array.isArray(parsedJson.insights)
-      ? parsedJson.insights.slice(0, 5).map(item => ({
-          type: validTypes.includes(item.type) ? item.type : 'GENERAL',
-          title: typeof item.title === 'string' && item.title ? item.title : 'Business Trend',
-          description: typeof item.description === 'string' && item.description ? item.description : 'Observed across platform shops.'
+      ? parsedJson.insights.slice(0, 5).map(i => ({
+          type: validInsightTypes.includes(i.type) ? i.type : 'GENERAL',
+          title: typeof i.title === 'string' && i.title ? i.title : 'Platform Observation',
+          description: typeof i.description === 'string' && i.description ? i.description : 'Based on aggregated platform statistics.'
         }))
       : [];
 
     const forbiddenKeywords = ['discount', 'special offer', 'promotion', 'price change', 'stock availability', 'delivery promise', 'product change'];
-
     const rawRecommendations = Array.isArray(parsedJson.recommendations) ? parsedJson.recommendations : [];
 
     const sanitizedRecommendations = rawRecommendations
@@ -1234,10 +1014,10 @@ ${JSON.stringify(rankingPayload, null, 2)}`;
       .slice(0, 4);
 
     const safeDefaults = [
-      'Review shops with low enquiry conversion rates.',
-      'Focus support on shops with high pending follow-up backlogs.',
-      'Investigate processes in top-performing shops to share best practices.',
-      'Monitor platform sales activity and shop engagement.'
+      'Focus platform support on shops with low enquiry conversion.',
+      'Encourage shops with high pending follow-ups to review customer queues.',
+      'Monitor sales and revenue metrics across all registered shops.',
+      'Support top-performing shops to maintain conversion momentum.'
     ];
 
     while (sanitizedRecommendations.length < 4) {
@@ -1264,7 +1044,7 @@ ${JSON.stringify(rankingPayload, null, 2)}`;
     console.error('[AI Admin Insights] Unexpected internal error:', err);
     return res.status(500).json({
       success: false,
-      error: 'Local AI is currently unavailable.'
+      error: 'AI service is currently unavailable.'
     });
   }
 });
@@ -1275,7 +1055,6 @@ router.post('/trends', requireAuth, async (req, res) => {
     const isAdmin = req.user?.role === 'admin';
     let targetShopId = req.user?.shopId;
 
-    // Strict Shop Isolation: Never trust req.body.shopId for non-admin users
     if (!isAdmin && !targetShopId) {
       return res.status(403).json({
         success: false,
@@ -1283,7 +1062,6 @@ router.post('/trends', requireAuth, async (req, res) => {
       });
     }
 
-    // Period Boundaries (30 Days Current vs 30 Days Previous)
     const now = new Date();
     const currentEnd = new Date(now);
     const currentStart = new Date(now);
@@ -1297,11 +1075,10 @@ router.post('/trends', requireAuth, async (req, res) => {
     previousStart.setDate(previousStart.getDate() - 30);
     previousStart.setHours(0, 0, 0, 0);
 
-    // Helpers for safe percentage change and direction
     const calcChange = (curr, prev) => {
       if (prev === 0) {
         if (curr === 0) return 0;
-        return null; // Return null when change cannot be meaningfully calculated
+        return null;
       }
       return Number((((curr - prev) / prev) * 100).toFixed(1));
     };
@@ -1326,7 +1103,6 @@ router.post('/trends', requireAuth, async (req, res) => {
       };
     };
 
-    // Construct MongoDB Match Queries
     const queryFilter = (dateStart, dateEnd) => {
       const filter = { createdAt: { $gte: dateStart, $lte: dateEnd } };
       if (!isAdmin) {
@@ -1335,7 +1111,6 @@ router.post('/trends', requireAuth, async (req, res) => {
       return filter;
     };
 
-    // Calculate Authoritative Backend Metrics for Current and Previous Periods
     const [
       currSalesDocs, prevSalesDocs,
       currEnquiries, prevEnquiries,
@@ -1385,7 +1160,6 @@ router.post('/trends', requireAuth, async (req, res) => {
       newCustomers: buildMetricObject('newCustomers', currNewCustomers, prevNewCustomers)
     };
 
-    // If Admin, calculate per-shop trends and ranking leaders
     let shopTrends = [];
     let shopLeaders = null;
 
@@ -1492,61 +1266,18 @@ ${JSON.stringify(metrics, null, 2)}
 
 ${isAdmin ? `SHOP LEADERS & PLATFORM HIGHLIGHTS:\n${JSON.stringify(shopLeaders, null, 2)}` : ''}`;
 
-    console.log('[AI Trends] Sending request to Ollama...');
-
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 120000);
-
-    let Res;
+    let generatedText;
     try {
-      ollamaRes = await fetch('http://127.0.0.1:11434/api/generate', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: 'qwen3:4b-instruct',
-          prompt,
-          stream: false,
-          think: false,
-          options: {
-            num_predict: 550,
-            temperature: 0.2
-          }
-        }),
-        signal: controller.signal
-      });
-    } catch (err) {
-      clearTimeout(timeoutId);
-      console.error('[AI Trends] Ollama connection error:', err.message);
-      return res.status(503).json({
+      generatedText = await generateAI(prompt, { maxTokens: 550, temperature: 0.2 });
+    } catch (aiErr) {
+      console.error('[AI Trends Error]:', aiErr.message);
+      return res.status(aiErr.status || 503).json({
         success: false,
-        error: 'Local AI is currently unavailable.'
+        error: aiErr.userMessage || 'AI trend analysis service is currently unavailable.'
       });
     }
 
-    clearTimeout(timeoutId);
-
-    if (!ollamaRes.ok) {
-      console.error('[AI Trends] Ollama status not OK:', ollamaRes.status);
-      return res.status(503).json({
-        success: false,
-        error: 'Local AI is currently unavailable.'
-      });
-    }
-
-    const data = await ollamaRes.json().catch(err => {
-      console.error('[AI Trends] JSON parse error:', err.message);
-      return null;
-    });
-
-    if (!data || typeof data.response !== 'string') {
-      return res.status(503).json({
-        success: false,
-        error: 'Local AI is currently unavailable.'
-      });
-    }
-
-    // Strip markdown code fences
-    let rawText = data.response.trim();
+    let rawText = generatedText.trim();
     if (rawText.startsWith('```')) {
       rawText = rawText.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
     }
@@ -1560,31 +1291,11 @@ ${isAdmin ? `SHOP LEADERS & PLATFORM HIGHLIGHTS:\n${JSON.stringify(shopLeaders, 
     try {
       parsedJson = JSON.parse(rawText);
     } catch (parseErr) {
-      if (rawText.includes('"trends":') && !rawText.endsWith('}')) {
-        let repaired = rawText;
-        if (!repaired.includes('"recommendations":')) {
-          repaired += ',\n"recommendations": []\n}';
-        } else if (!repaired.endsWith(']')) {
-          repaired += '"]\n}';
-        } else {
-          repaired += '\n}';
-        }
-        try {
-          parsedJson = JSON.parse(repaired);
-        } catch (rErr) {
-          console.error('[AI Trends] Failed to parse Qwen JSON after repair attempt:', rawText);
-          return res.status(500).json({
-            success: false,
-            error: 'AI trend analysis could not be completed.'
-          });
-        }
-      } else {
-        console.error('[AI Trends] Failed to parse Qwen JSON:', rawText);
-        return res.status(500).json({
-          success: false,
-          error: 'AI trend analysis could not be completed.'
-        });
-      }
+      console.error('[AI Trends] Failed to parse Qwen JSON:', rawText);
+      return res.status(500).json({
+        success: false,
+        error: 'AI trend analysis could not be completed.'
+      });
     }
 
     const validTypes = ['SALES', 'REVENUE', 'ENQUIRY', 'CONVERSION', 'FOLLOW_UP', 'CUSTOMER', 'SHOP_ACTIVITY', 'GENERAL'];
@@ -1649,7 +1360,7 @@ ${isAdmin ? `SHOP LEADERS & PLATFORM HIGHLIGHTS:\n${JSON.stringify(shopLeaders, 
     console.error('[AI Trends] Unexpected internal error:', err);
     return res.status(500).json({
       success: false,
-      error: 'Local AI is currently unavailable.'
+      error: 'AI service is currently unavailable.'
     });
   }
 });

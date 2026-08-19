@@ -39,22 +39,29 @@ const JWT_SECRET = process.env.JWT_SECRET || 'quickr_super_secret_jwt_key_987654
 const allowedOrigins = [
   'http://localhost:5173',
   'http://127.0.0.1:5173',
+  'http://localhost:5174',
+  'http://127.0.0.1:5174',
   'http://localhost:3000',
   'http://127.0.0.1:3000',
+  'https://quickr-vendors-friendly-mac.onrender.com',
   process.env.FRONTEND_URL
 ].filter(Boolean);
 
 app.use(cors({
   origin: (origin, callback) => {
-    // Allow non-browser requests or matching allowed origins
+    // Allow non-browser requests (mobile apps, curl, etc.) or matching allowed origins
     if (!origin || allowedOrigins.includes(origin)) {
       callback(null, true);
     } else {
+      // Return CORS policy error for unauthorized origin preflight/requests
       callback(new Error('Not allowed by CORS origin policy'));
     }
   },
-  credentials: true
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'Origin']
 }));
+
 app.use(express.json());
 app.use(cookieParser());
 
@@ -171,16 +178,12 @@ setTimeout(seedDatabaseIfNeeded, 1500);
 setTimeout(async () => { await seedAdmin(); }, 2000);
 
 const setAuthCookie = (res, token) => {
-  const isProduction =
-    process.env.NODE_ENV === 'production' ||
-    process.env.RENDER === 'true';
-
+  const isProduction = process.env.NODE_ENV === 'production' || process.env.RENDER === 'true';
   res.cookie('token', token, {
     httpOnly: true,
-    secure: isProduction,
     sameSite: isProduction ? 'none' : 'lax',
-    maxAge: 7 * 24 * 60 * 60 * 1000,
-    path: '/'
+    secure: isProduction,
+    maxAge: 7 * 24 * 60 * 60 * 1000
   });
 };
 
