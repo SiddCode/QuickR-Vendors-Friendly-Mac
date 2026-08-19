@@ -377,11 +377,12 @@ export const SmartFollowUp: React.FC<SmartFollowUpProps> = ({
                           purchaseStatus: currentEnquiry?.purchaseStatus,
                           followUpReason: currentFollowUp?.reason
                         });
+                        console.log("AI FOLLOWUP RESPONSE:", res);
                         if (res.success && res.message) {
                           setCustomMsg(res.message);
                           setHasAiGenerated(true);
                         } else {
-                          setAiError(res.error || 'Local AI is currently unavailable.');
+                          setAiError(res.error || 'AI generation is currently unavailable.');
                         }
                       } catch (err: any) {
                         setAiError(err.message || 'Local AI is currently unavailable.');

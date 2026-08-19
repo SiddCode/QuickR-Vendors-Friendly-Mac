@@ -199,6 +199,63 @@ Rules:
 - No explanation
 - Return ONLY the WhatsApp message`;
 
+    const isContaminated = (text) => {
+      if (!text || typeof text !== 'string') return true;
+      const lower = text.toLowerCase();
+      const forbiddenPhrases = [
+        "we need to produce",
+        "generate only",
+        "rules:",
+        "max 40 words",
+        "maximum 40 words",
+        "let's craft something like",
+        "no invented discounts",
+        "use customer's name",
+        "customer name:",
+        "purchase status:",
+        "follow-up reason:",
+        "whatsapp message:"
+      ];
+      return forbiddenPhrases.some(phrase => lower.includes(phrase));
+    };
+
+    const cleanResponseText = (rawText) => {
+      let cleaned = (rawText || '').trim();
+
+      if (
+        (cleaned.startsWith('"') && cleaned.endsWith('"')) ||
+        (cleaned.startsWith("'") && cleaned.endsWith("'"))
+      ) {
+        cleaned = cleaned.slice(1, -1).trim();
+      }
+
+      const prefixes = [
+        /^Suggested Message:\s*/i,
+        /^Message:\s*/i,
+        /^WhatsApp Message:\s*/i,
+        /^Here is the message:\s*/i,
+        /^WhatsApp follow-up message:\s*/i,
+        /^Draft:\s*/i
+      ];
+      for (const prefix of prefixes) {
+        cleaned = cleaned.replace(prefix, '').trim();
+      }
+
+      if (
+        (cleaned.startsWith('"') && cleaned.endsWith('"')) ||
+        (cleaned.startsWith("'") && cleaned.endsWith("'"))
+      ) {
+        cleaned = cleaned.slice(1, -1).trim();
+      }
+
+      const words = cleaned.split(/\s+/).filter(Boolean);
+      if (words.length > 40) {
+        cleaned = words.slice(0, 40).join(' ');
+      }
+
+      return cleaned;
+    };
+
     let generatedText;
     try {
       generatedText = await generateAI(prompt, { maxTokens: 200, temperature: 0.7 });
@@ -210,56 +267,27 @@ Rules:
       });
     }
 
-    let cleanedMessage = (generatedText || '').trim();
+    let cleanedMessage = cleanResponseText(generatedText);
 
-    // Strip quotation marks surrounding the message
-    if (
-      (cleanedMessage.startsWith('"') && cleanedMessage.endsWith('"')) ||
-      (cleanedMessage.startsWith("'") && cleanedMessage.endsWith("'"))
-    ) {
-      cleanedMessage = cleanedMessage.slice(1, -1).trim();
+    if (isContaminated(cleanedMessage)) {
+      console.warn('[AI Route - followup-message] Prompt contamination detected in response, attempting fallback re-generation...');
+      try {
+        const fallbackText = await generateAI(prompt, { maxTokens: 200, temperature: 0.8 });
+        cleanedMessage = cleanResponseText(fallbackText);
+      } catch (fbErr) {
+        console.error('[AI Route - followup-message Fallback Error]:', fbErr.message);
+      }
     }
 
-    // Strip common prefixes
-    const prefixes = [
-      /^Suggested Message:\s*/i,
-      /^Message:\s*/i,
-      /^WhatsApp Message:\s*/i,
-      /^Here is the message:\s*/i,
-      /^WhatsApp follow-up message:\s*/i
-    ];
-    for (const prefix of prefixes) {
-      cleanedMessage = cleanedMessage.replace(prefix, '').trim();
-    }
-
-    // Remove any remaining surrounding quotes after prefix stripping
-    if (
-      (cleanedMessage.startsWith('"') && cleanedMessage.endsWith('"')) ||
-      (cleanedMessage.startsWith("'") && cleanedMessage.endsWith("'"))
-    ) {
-      cleanedMessage = cleanedMessage.slice(1, -1).trim();
-    }
-
-    // Ensure prompt text is never returned
-    if (cleanedMessage.includes('Generate ONLY') || cleanedMessage.includes('Rules:')) {
+    if (isContaminated(cleanedMessage) || !cleanedMessage) {
+      console.error('[AI Route - followup-message] Final message was contaminated or empty. Rejecting output.');
       return res.status(503).json({
         success: false,
-        error: 'AI generated invalid message content.'
+        error: 'AI generated an invalid response. Please try again.'
       });
     }
 
-    // Enforce maximum 40 words
-    const words = cleanedMessage.split(/\s+/).filter(Boolean);
-    if (words.length > 40) {
-      cleanedMessage = words.slice(0, 40).join(' ');
-    }
-
-    if (!cleanedMessage) {
-      return res.status(503).json({
-        success: false,
-        error: 'AI generated an empty message.'
-      });
-    }
+    console.log("AI FOLLOWUP RESPONSE:", { success: true, messageLength: cleanedMessage.length });
 
     return res.json({
       success: true,
