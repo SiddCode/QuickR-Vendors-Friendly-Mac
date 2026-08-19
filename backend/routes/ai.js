@@ -50,7 +50,7 @@ export async function generateAI(prompt, options = {}) {
         },
 
         body: JSON.stringify({
-          model: 'qwen/qwen3.6-plus:free',
+          model: 'qwen/qwen3-30b-a3b:free',
 
           messages: [
             {
