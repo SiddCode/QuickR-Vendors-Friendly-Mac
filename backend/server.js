@@ -171,11 +171,16 @@ setTimeout(seedDatabaseIfNeeded, 1500);
 setTimeout(async () => { await seedAdmin(); }, 2000);
 
 const setAuthCookie = (res, token) => {
+  const isProduction =
+    process.env.NODE_ENV === 'production' ||
+    process.env.RENDER === 'true';
+
   res.cookie('token', token, {
     httpOnly: true,
-    sameSite: 'lax',
-    secure: process.env.NODE_ENV === 'production',
-    maxAge: 7 * 24 * 60 * 60 * 1000
+    secure: isProduction,
+    sameSite: isProduction ? 'none' : 'lax',
+    maxAge: 7 * 24 * 60 * 60 * 1000,
+    path: '/'
   });
 };
 
